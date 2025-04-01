@@ -45,6 +45,12 @@ def print_performance_table():
         print(f"{key:<30}{avg:>15.4f}{data['count']:>10}")
     print("-" * 60)
 
+def generate_large_prime():
+    while True:
+        prime = random.randint(2**10, 2**12)
+        if all(prime % i != 0 for i in range(2, int(prime**0.5) + 1)):
+            return prime
+
 @measure_time("KeyPair")
 def generate_key_pair(prime, g):
     private_key = random.randint(1, prime - 1)
@@ -53,7 +59,6 @@ def generate_key_pair(prime, g):
 
 @measure_time("Hash")
 def compute_hash(message):
-    # All SHA-256 operations are done via this function.
     return sha256(message.encode('utf-8')).hexdigest()
 
 @measure_time("SignGen")
@@ -84,12 +89,6 @@ def gcd(a, b):
         a, b = b, a % b
     return a
 
-def generate_large_prime():
-    while True:
-        prime = random.randint(2**10, 2**12)
-        if all(prime % i != 0 for i in range(2, int(prime**0.5) + 1)):
-            return prime
-
 class DoctorServer:
     def __init__(self, host='127.0.0.1', port=5000):
         self.host = host
@@ -99,21 +98,12 @@ class DoctorServer:
         self.server.listen(5)  # Up to 5 simultaneous connections
 
         # Per-client information stored as a dictionary:
-        # {
-        #   patient_id: {
-        #       "conn": connection,
-        #       "prime": p,
-        #       "g": g,
-        #       "doctor_private": d,
-        #       "doctor_public": D,
-        #       "session_key": s
-        #   }
-        # }
+        # { patient_id: {"conn": connection, "prime": p, "g": g,
+        #                "doctor_private": d, "doctor_public": D, "session_key": s} }
         self.client_info = {}
         self.id_gwn = "GWN_Doctor_1"
         self.rn_doctor = random.randint(1000, 9999)
         self.delta_ts = 5  # seconds
-        # Doctor's long-term key (KRGWN) used for group key generation.
         self.long_term_key = random.randint(100000, 999999)
 
     def block_patient(self, patient_id):
@@ -123,61 +113,16 @@ class DoctorServer:
         print(f"[INFO] Patient {patient_id} is now blocked.")
 
     def compute_group_key(self):
-        # Compute GK = h( SKD1 ∥ SKD2 ∥ ... ∥ SKDn ∥ KRGWN )
         keys = []
         for pid in sorted(self.client_info.keys()):
             sk = self.client_info[pid].get("session_key")
             if sk is not None:
                 keys.append(str(sk))
-        concatenated = "".join(keys) + str(self.long_term_key)
+        concatenated = "".join(keys) + str(self.docPrivateKey)
         GK = compute_hash(concatenated)
         return GK
 
     def send_group_key(self):
-        """
-        Sends the group key (GK) to each unblocked, authenticated patient,
-        encrypted under the patient's session key using AES-CBC with
-        a random IV. We embed the IV at the start of the ciphertext.
-        """
-        GK = self.compute_group_key()
-        for patient_id, info in self.client_info.items():
-            if patient_id in blocked_ids:
-                continue  # Skip blocked patients
-            try:
-                conn = info["conn"]
-                p_conn = info["prime"]
-                session_key = info.get("session_key")
-                if session_key is None:
-                    continue
-
-                # Convert session key to 16-byte key.
-                sk_effective = session_key % p_conn
-                key_bytes = sk_effective.to_bytes(16, byteorder='big', signed=False)
-
-                # Use AES-CBC with random IV
-                iv = get_random_bytes(AES.block_size)
-                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
-                encrypted_GK = iv + cipher.encrypt(pad(GK.encode('utf-8'), AES.block_size))
-
-                msg = {"opcode": 30, "encrypted_group_key": encrypted_GK}
-                conn.send(pickle.dumps(msg))
-                print(f"[Opcode 30] Sent encrypted group key to patient {patient_id}.")
-            except Exception as e:
-                print(f"[Opcode 30] Failed to send group key to patient {patient_id}: {e}")
-        return GK
-
-    def broadcast_message(self, message):
-        """
-        1. Compute new group key (GK).
-        2. Send GK to each authenticated, unblocked patient (opcode 30).
-        3. Encrypt the actual broadcast message with GK using AES-CBC + random IV,
-           send to each authenticated, unblocked patient (opcode 40).
-        """
-        if not self.client_info:
-            print("No authenticated patients to broadcast to.")
-            return
-
-        # Step 1 & 2: Send the group key
         GK = self.compute_group_key()
         for patient_id, info in self.client_info.items():
             if patient_id in blocked_ids:
@@ -188,29 +133,56 @@ class DoctorServer:
                 session_key = info.get("session_key")
                 if session_key is None:
                     continue
+                sk_effective = session_key
+                #sk_effective = session_key
+                #key_bytes = sk_effective.to_bytes(16, byteorder='big', signed=False)
+                key_bytes = bytes.fromhex(sk_effective)
+                iv = get_random_bytes(AES.block_size)
+                cipher = AES.new(key_bytes, AES.MODE_CBC, iv)
+                encrypted_GK = iv + cipher.encrypt(pad(GK.encode('utf-8'), AES.block_size))
+                msg = {"opcode": 30, "encrypted_group_key": encrypted_GK}
+                conn.send(pickle.dumps(msg))
+                print(f"[Opcode 30] Sent encrypted group key to patient {patient_id}.")
+            except Exception as e:
+                print(f"[Opcode 30] Failed to send group key to patient {patient_id}: {e}")
+        return GK
 
-                # Convert session key to 16-byte key.
-                sk_effective = session_key % p_conn
-                key_bytes = sk_effective.to_bytes(16, byteorder='big', signed=False)
+    def broadcast_message(self, message):
+        if not self.client_info:
+            print("No authenticated patients to broadcast to.")
+            return
+
+        # Step 1: Send new group key
+        GK = self.compute_group_key()
+        for patient_id, info in self.client_info.items():
+            if patient_id in blocked_ids:
+                continue
+            try:
+                conn = info["conn"]
+                p_conn = info["prime"]
+                session_key = info.get("session_key")
+                if session_key is None:
+                    continue
+                sk_effective = session_key
+                print(sk_effective)
+                #key_bytes = sk_effective.to_bytes(16, byteorder='big', signed=False)
+                key_bytes = bytes.fromhex(sk_effective)
 
                 iv_gk = get_random_bytes(AES.block_size)
                 cipher_gk = AES.new(key_bytes, AES.MODE_CBC, iv_gk)
                 encrypted_GK = iv_gk + cipher_gk.encrypt(pad(GK.encode('utf-8'), AES.block_size))
-
                 msg_group = {"opcode": 30, "encrypted_group_key": encrypted_GK}
                 conn.send(pickle.dumps(msg_group))
                 print(f"[Opcode 30] Sent encrypted group key to patient {patient_id}.")
             except Exception as e:
                 print(f"[Opcode 30] Failed to send group key to patient {patient_id}: {e}")
 
-        # Step 3: Broadcast the actual message using GK in AES-CBC
-        key_for_group = GK[:32]  # 32 hex chars = 16 bytes
+        # Step 2: Broadcast the actual message using GK in AES-CBC
+        key_for_group = GK[:32]  # first 32 hex characters = 16 bytes
         group_key_bytes = bytes.fromhex(key_for_group)
-
         iv_msg = get_random_bytes(AES.block_size)
         cipher_group = AES.new(group_key_bytes, AES.MODE_CBC, iv_msg)
         encrypted_message = iv_msg + cipher_group.encrypt(pad(message.encode('utf-8'), AES.block_size))
-
         for patient_id, info in self.client_info.items():
             if patient_id in blocked_ids:
                 continue
@@ -232,12 +204,6 @@ class DoctorServer:
         self.server.close()
 
     def doctor_input_thread(self):
-        """
-        Accepts commands from the server console:
-        - 'Block <PatientID>' to block the patient
-        - 'exit' to terminate
-        - any other text is broadcast to all unblocked patients
-        """
         while True:
             try:
                 message = input("\nEnter message to broadcast (or 'Block Patient_ID' to block, 'exit' to stop): ")
@@ -292,7 +258,6 @@ class DoctorServer:
                 patient_id = initial_msg["id_patient"]
                 current_time = time.time()
 
-                # Check if already active
                 if patient_id in active_ids:
                     msg = {"opcode": 70, "message": "Already Active Connection Exists."}
                     conn.send(pickle.dumps(msg))
@@ -300,7 +265,6 @@ class DoctorServer:
                     conn.close()
                     return
 
-                # Check if currently blocked
                 if patient_id in blocked_ids:
                     block_time = blocked_ids[patient_id]
                     if current_time - block_time < 120:
@@ -318,6 +282,7 @@ class DoctorServer:
                 p_client, g_client, _ = public_key_patient
 
                 d, D = generate_key_pair(p_client, g_client)
+                self.docPrivateKey=d
                 self.client_info[patient_id] = {
                     "conn": conn,
                     "prime": p_client,
@@ -325,6 +290,7 @@ class DoctorServer:
                     "doctor_private": d,
                     "doctor_public": D
                 }
+
                 response_pk = {"opcode": 5, "public_key_doctor": (p_client, g_client, D)}
                 conn.send(pickle.dumps(response_pk))
                 print(f"[INFO] Domain parameters accepted and doctor's key pair generated for patient {patient_id}")
@@ -356,7 +322,6 @@ class DoctorServer:
             g_conn = info["g"]
             d = info["doctor_private"]
 
-            # Check timestamp
             if abs(time.time() - ts_patient) > self.delta_ts:
                 print(f"[ERROR] Timestamp validation failed for patient {patient_id}. Disconnecting.")
                 self.block_patient(patient_id)
@@ -364,7 +329,6 @@ class DoctorServer:
                 conn.close()
                 return
 
-            # Verify signature
             msg_to_verify = f"{ts_patient}{rn_patient}{self.id_gwn}{c1}{c2}"
             if not elgamal_verify(msg_to_verify, sign_data1, y_client, p_conn, g_conn):
                 print(f"[ERROR] Signature validation failed for patient {patient_id}. Disconnecting.")
@@ -407,7 +371,6 @@ class DoctorServer:
             skv_patient = final_validation['skv_patient']
             ts_patient_final = final_validation['ts_patient_final']
 
-            # Check final timestamp
             if abs(time.time() - ts_patient_final) > self.delta_ts:
                 print(f"[ERROR] Final timestamp validation failed for patient {patient_id}. Disconnecting.")
                 self.block_patient(patient_id)
@@ -415,7 +378,6 @@ class DoctorServer:
                 conn.close()
                 return
 
-            # Compute server side SKV
             computed_sk_input = f"{session_key}{ts_patient}{ts_doctor}{rn_patient}{self.rn_doctor}{patient_id}{self.id_gwn}"
             computed_sk = compute_hash(computed_sk_input)
             print(f"Server SKV for patient {patient_id}: {computed_sk}")
@@ -426,12 +388,13 @@ class DoctorServer:
             if computed_skv == skv_patient:
                 print(f"[Opcode 20: SESSION TOKEN] Session key validation successful for patient {patient_id}. Secure communication established.")
                 authenticated = True
+                info["session_key"] = computed_sk
+                #self.client_info["session_key"]=computed_sk
                 print_performance_table()
             else:
                 print(f"[ERROR] Session key validation failed for patient {patient_id}. Disconnecting.")
                 self.block_patient(patient_id)
                 conn.send(pickle.dumps({"opcode": 80, "message": "Session key validation failed. Authentication blocked."}))
-
         except Exception as e:
             print(f"[ERROR] An exception occurred with patient {patient_id}: {e}")
             if patient_id:
@@ -443,7 +406,26 @@ class DoctorServer:
                 if patient_id in self.client_info:
                     del self.client_info[patient_id]
                 conn.close()
-            # Authenticated connections remain open.
+                return
+
+        try:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                msg = pickle.loads(data)
+                if "opcode" in msg and msg["opcode"] == 90:
+                    print(f"[Opcode 90] Received exit message from patient {patient_id}. Removing connection.")
+                    break
+        except Exception as e:
+            print(f"[ERROR] Exception while listening for messages from patient {patient_id}: {e}")
+        finally:
+            if patient_id in active_ids:
+                active_ids.remove(patient_id)
+            if patient_id in self.client_info:
+                del self.client_info[patient_id]
+            conn.close()
+            print(f"Connection with patient {patient_id} closed.")
 
 if __name__ == "__main__":
     server = DoctorServer()
